@@ -1,0 +1,205 @@
+#!/usr/bin/env python3.8
+import sys
+import os
+
+import numpy as np
+from Bio import SeqIO
+import datetime
+
+from sklearn.metrics import accuracy_score,precision_score, recall_score,classification_report
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
+print(sys.path)
+
+import argparse
+import lightgbm as lgb
+import csv
+from sklearn.preprocessing import LabelEncoder
+import multiprocessing
+from joblib import load
+
+def parse_args(args):
+    parser = argparse.ArgumentParser(description="A Framework of k-mer Based Hierarchical Classification")
+    parser._action_groups.pop()
+    required_args = parser.add_argument_group('required arguments')
+    required_args.add_argument('-f', required = True, help='Input fasta file')
+    required_args.add_argument('-o', required = True, help='Output directory')
+    required_args.add_argument('-db', required = True, help='Run BLAST with provided database')
+    required_args.add_argument('-m', required = True, help='Best model directoty')
+    required_args.add_argument('-k', required=True)  
+    if len(sys.argv)==1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    return parser.parse_args()
+
+
+G =['A','T','C','G']
+def generate_feature_vector(sequence_file, k, label):
+    kmers=[]
+    feature_vector = {}
+    feature_matrix = []
+    label_vector = []
+    re=[]
+    with open(sequence_file,'r') as f:
+        for record in SeqIO.parse(f, "fasta"):
+            seq = str(record.seq)
+            kmer =[]
+            kmers = [seq[i:i+k] for i in range(len(seq)-k+1)]
+            
+            for i1 in G:
+                for i2 in G:
+                    for i3 in G:
+                        for i4 in G:
+                            for i5 in G:
+                                km=i1+i2+i3+i4+i5
+                                feature_vector[km]=0
+            for kmer in kmers:
+                if kmer not in feature_vector:
+                    continue
+                else:
+                    feature_vector[kmer] += 1
+
+            feature_matrix.append(list(feature_vector.values()))
+            label_vector.append(label)
+            re.append(sequence_file)
+
+
+    return feature_matrix,label_vector,re
+
+def generate_feature_matrix(sequence_folder, k, label):
+    files = os.listdir(sequence_folder)
+    feature_matrix = []
+    label_vector = []
+    route=[]
+    results = []
+    pool = multiprocessing.Pool(4)
+
+    for file in files:
+        result =pool.apply_async(generate_feature_vector, args=(os.path.join(sequence_folder, file), k,label,))
+        results.append(result)
+
+
+    pool.close()
+    pool.join()
+
+    for result in results:
+        fm, lv,re = result.get()
+        feature_matrix += fm
+        label_vector += lv
+        route+=re
+    return feature_matrix, label_vector,route
+
+
+def generate_feature_matrix_multiple(sequence_folders, k):
+    feature_matrix = []
+    label_vector = []
+    route=[]
+    weight= dict()
+    files = os.listdir(sequence_folders)
+
+    for sequence_folder in files:
+        fm, lv,re = generate_feature_matrix(os.path.join(sequence_folders, sequence_folder), k, sequence_folder)
+        feature_matrix += fm
+        label_vector += lv
+        label=lv[0]
+        weight[label]=9773/(10*len(lv))
+        route.extend(re)
+    return np.array(feature_matrix), np.array(label_vector),weight,np.array(route)
+
+
+args = parse_args(sys.argv[1:])
+sequence_folders=args.f
+dirname = os.path.dirname(__file__)
+outdir = args.o 
+db=args.db
+k=int(args.k)
+model_dir=args.m
+best_model = load(model_dir+'/best_model.joblib')
+scaler = load(model_dir+'/scaler.joblib')
+pca = load(model_dir+'/pca.joblib')
+lgbm=load(model_dir+'/lgbm_model.joblib')
+lr = load(model_dir+'/lr_model.joblib')
+svc = load(model_dir+'/svc_model.joblib')
+rf = load(model_dir+'/rf_model.joblib')
+
+
+time1=datetime.datetime.now()
+feature_matrix, label_vector11,weight,route= generate_feature_matrix_multiple(sequence_folders, k)
+feature_matrix_scaled = scaler.transform(feature_matrix)
+feature_matrix_pca = pca.transform(feature_matrix_scaled)
+
+res = np.load('label.npy',allow_pickle=True)
+label=res.item()
+new_res = {v:k for k,v in label.items()}
+label_vector=[]
+for vector in label_vector11:
+    label_vector .append( label[vector])
+
+y_pred_lgbm = lgbm.predict(feature_matrix_pca)
+y_pred_lr = lr.predict(feature_matrix_pca)
+y_pred_svc = svc.predict(feature_matrix_pca)
+y_pred_rf = rf.predict(feature_matrix_pca)
+
+feature_matrix_combined = np.concatenate((feature_matrix_pca, y_pred_lgbm.reshape(-1, 1),
+                                y_pred_lr.reshape(-1, 1),
+                                y_pred_svc.reshape(-1, 1),
+                                y_pred_rf.reshape(-1, 1)), axis=1)
+
+y_pred1 = best_model.predict_proba(feature_matrix_combined)
+y_pred=best_model.predict(feature_matrix_combined)
+n=0
+for i in range(y_pred1.shape[0]):
+    index=np.argsort(y_pred1[i])
+    number=np.sort(y_pred1[i])
+    a=np.mean(y_pred1[i])
+    b=np.var(y_pred1[i])
+    if(y_pred[i]==label_vector[i]):
+        result='true'
+    else:
+        result='flase'
+    if number[-1]<=0.7 or b<=0.008:
+        filename=route[i]
+        n+=1
+        rs=filename.rsplit("/",1)[1]
+        rs1=rs.rsplit("_",2)[0]
+        out=outdir+rs1
+        os.system("blastn -query "+ filename + " -db "+ db +" -evalue 1e-6 -outfmt 6 -num_threads 6 -out "+ out)
+        with open(out) as f:
+            firstline = f.readline().rstrip()
+            if len(firstline)==0:
+                pr_label=new_res[index[-1]]
+                pr_probability=number[-1] 
+                pr = [rs1,pr_label,pr_probability]   
+                with open(out, 'w') as output:
+                    writer = csv.writer(output, lineterminator='\n')
+                    writer.writerow(pr)
+            else:
+                la=firstline.split("\t")[1]
+                la=la.split(".")[0]
+                probability=firstline.split("\t")[2]
+                y_pred[i]=label[la]
+
+
+    else:
+
+        pr_label=new_res[index[-1]]
+        pr_probability=number[-1] 
+        filename=route[i]
+        rs=filename.rsplit("/",1)[1]
+        rs1=rs.rsplit("_",2)[0]
+        out=outdir+rs1
+        pr = [rs1,pr_label,pr_probability]    
+        with open(out, 'w') as output:
+            writer = csv.writer(output, lineterminator='\n')
+            writer.writerow(pr)
+
+
+report = classification_report(label_vector, y_pred) 
+
+time2=datetime.datetime.now()
+time_delta = time2 - time1
+total_seconds = time_delta.total_seconds()
+minutes, seconds = divmod(total_seconds, 60)
+print("Executing this data takes time: {} minutes {} seconds".format(int(minutes), int(seconds)))
+print("The execution results can be found in "+ outdir)
